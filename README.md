@@ -48,7 +48,7 @@
    
 2. Commit  
     ```bash
-    git commit -m "[FAIT]"
+    git commit -m "[FAIT] v"
     ```
    
 3. Force le push  
