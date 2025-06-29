@@ -55,3 +55,4 @@
     ```bash
     git push --force origin main
     ```
+// Faire en sorte que ça soit adapter au telephone aussi taille ecran 

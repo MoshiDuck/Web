@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import tkinter as tk
@@ -30,6 +31,7 @@ BASE_DIR    = Path(__file__).resolve().parent
 CODES_FILE =BASE_DIR / "codes.txt"
 ARCHIVES_DIR = BASE_DIR / "archives"
 IMAGES_DIR   = BASE_DIR / "images"
+LINKS_FILE = BASE_DIR / "links.json"
 FFMPEG_PATH = BASE_DIR / "Ressource" / "ffmpeg" / "bin" / "ffmpeg.exe"
 FFPROBE_PATH = BASE_DIR / "Ressource" / "ffmpeg" / "bin" / "ffprobe.exe"
 UNRAR_PATH = BASE_DIR / "Ressource" / "unrar" / "UnRAR.exe"
@@ -131,9 +133,8 @@ def sanitize_name(name: str) -> str:
     clean = re.sub(TRAILING_DOTS_SPACES, '', clean)
     return clean or "archive"
 
-def upload_to_1fichier(client, file_path: Path) -> str:
+def upload_to_1fichier(client, file_path: Path, links_map: dict) -> str:
     """Envoie le fichier sur 1fichier.com et renvoie le lien de téléchargement."""
-    # Obtention du serveur d'upload
     resp = client.api_call(
         'https://api.1fichier.com/v1/upload/get_upload_server.cgi', method='GET'
     )
@@ -143,7 +144,6 @@ def upload_to_1fichier(client, file_path: Path) -> str:
 
     def progress_callback(monitor):
         pct = int(100 * monitor.bytes_read / monitor.len)
-        # on print seulement aux multiples de 10 et une seule fois chacun
         if pct % 10 == 0 and pct != last_printed['pct']:
             print(f"Progression upload: {pct}%")
             last_printed['pct'] = pct
@@ -151,7 +151,6 @@ def upload_to_1fichier(client, file_path: Path) -> str:
     with open(file_path, 'rb') as f:
         encoder = MultipartEncoder({'file[]': (file_path.name, f, 'application/octet-stream')})
         monitor = MultipartEncoderMonitor(encoder, progress_callback)
-
 
         headers = {'Content-Type': monitor.content_type}
         if client.authed:
@@ -168,7 +167,13 @@ def upload_to_1fichier(client, file_path: Path) -> str:
         if not m:
             raise FichierResponseNotOk('Lien de téléchargement introuvable')
 
-        return m.group(1)
+        link = m.group(1)
+        # on conserve le lien sous la clé <nom_fichier>
+        links_map[file_path.name] = link
+        # on sauvegarde immédiatement
+        with LINKS_FILE.open("w", encoding="utf-8") as jf:
+            json.dump(links_map, jf, ensure_ascii=False, indent=2)
+        return link
 
 def extract_rar_with_unrar(archive_path: str, dest_dir: Path) -> bool:
     cmd = [
@@ -330,7 +335,14 @@ def collect_first_images():
 def build_gallery_html(codes):
     """
     codes: liste de noms de fichiers (ex. ['1499 dezomorfina.zip', ...])
+    Utilise links.json pour récupérer l’URL 1fichier de chaque archive.
     """
+    # charge le mapping fichier → URL
+    if LINKS_FILE.exists():
+        links_map = json.loads(LINKS_FILE.read_text(encoding="utf-8"))
+    else:
+        links_map = {}
+
     placeholder = "https://via.placeholder.com/200x150?text=No+Thumb"
     out = BASE_DIR / "index.html"
     with out.open("w", encoding="utf-8") as f:
@@ -340,22 +352,17 @@ def build_gallery_html(codes):
             stem = Path(archive_name).stem
             safe = sanitize_name(stem)
 
-            # cherche la vignette locale
-            thumb = None
-            for img in IMAGES_DIR.iterdir():
-                if img.stem == safe:
-                    thumb = img.name
-                    break
-
-            # si pas de vignette, on utilisera le placeholder
+            # vignette
+            thumb = next((img.name for img in IMAGES_DIR.iterdir() if img.stem == safe), None)
             img_src = f"images/{thumb}" if thumb else placeholder
 
-            # lien vers l’archive locale (téléchargement)
-            archive_rel = f"archives/{archive_name}"
+            # lien 1fichier ou fallback local
+            href = links_map.get(archive_name, f"archives/{archive_name}")
+            download_attr = "" if href.startswith("http") else " download"
 
             f.write(f'''
     <div class="card">
-      <a href="{archive_rel}" download>
+      <a href="{href}" target="_blank"{download_attr}>
         <img src="{img_src}" alt="{stem}" />
         <div class="card-title">{stem}</div>
       </a>
@@ -408,6 +415,10 @@ def main():
     if not CODES_FILE.exists():
         CODES_FILE.touch()
         print(f"[INFO] Création de {CODES_FILE}")
+    if LINKS_FILE.exists():
+        links_map = json.loads(LINKS_FILE.read_text(encoding="utf-8"))
+    else:
+        links_map = {}
 
     # 2. Chargement des archives déjà traitées
     processed = set()
@@ -445,7 +456,7 @@ def main():
         print(f"=== Traitement et upload de {entry} ===")
         try:
             # upload (on peut conserver la récupération de lien si utile)
-            link = upload_to_1fichier(client, path)
+            link = upload_to_1fichier(client, path, links_map)
             print(f"[DEBUG] Lien retourné : {link}")
         except Exception as e:
             print(f"[UPLOAD ERREUR] {e}")
