@@ -1,17 +1,14 @@
-import json
 import os
+import re
 import shutil
+import subprocess
+import tarfile
 import tkinter as tk
+import zipfile
 from json import JSONDecodeError
 from pathlib import Path
 from tkinter import filedialog
-import subprocess
-import re
-import zipfile
-import tarfile
-from urllib.parse import urlparse, parse_qs
 
-from PyQt6.QtCore import QThread, pyqtSignal
 from pyOneFichierClient.OneFichierAPI.exceptions import FichierSyntaxError, FichierResponseNotOk
 from pyOneFichierClient.OneFichierAPI.py1FichierClient import s
 from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
@@ -31,7 +28,6 @@ BASE_DIR    = Path(__file__).resolve().parent
 CODES_FILE =BASE_DIR / "codes.txt"
 ARCHIVES_DIR = BASE_DIR / "archives"
 IMAGES_DIR   = BASE_DIR / "images"
-LINKS_FILE = BASE_DIR / "links.json"
 FFMPEG_PATH = BASE_DIR / "Ressource" / "ffmpeg" / "bin" / "ffmpeg.exe"
 FFPROBE_PATH = BASE_DIR / "Ressource" / "ffmpeg" / "bin" / "ffprobe.exe"
 UNRAR_PATH = BASE_DIR / "Ressource" / "unrar" / "UnRAR.exe"
@@ -39,17 +35,16 @@ INVALID_CHARS        = r'[<>:"/\\|?*]'
 TRAILING_DOTS_SPACES = r'[\. ]+$'
 
 HTML_HEAD = f"""<!DOCTYPE html>
-<html lang="fr">
+<html lang=\"fr\">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta charset=\"UTF-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
   <title>Galerie de Téléchargement</title>
   <style>
     body {{ font-family: sans-serif; margin: 2rem; }}
     .grid {{
       display: grid;
-      /* Toujours 6 colonnes minimum, chaque colonne s’adapte */
-      grid-template-columns: repeat(6, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
       gap: 1rem;
     }}
     .card {{
@@ -59,35 +54,18 @@ HTML_HEAD = f"""<!DOCTYPE html>
       text-align: center;
       background: #f9f9f9;
     }}
-    .card img {{
-      display: block;
-      width: auto;
-      max-width: 100%;
-      height: auto;
-      background: #fff;
-    }}
-    .card-title {{
-      margin: 0.5rem;
-      font-size: 1rem;
-    }}
-    .card a {{
-      display: block;
-      text-decoration: none;
-      color: #333;
-      padding: 0.5rem;
-    }}
-    .card a:hover {{
-      background: #f0f0f0;
-    }}
+    .card img {{ display: block; max-width: 100%; height: auto; background: #fff; }}
+    .card-title {{ margin: 0.5rem; font-size: 1rem; }}
+    .card a {{ display: block; text-decoration: none; color: #333; padding: 0.5rem; }}
+    .card a:hover {{ background: #f0f0f0; }}
   </style>
   <!-- Linkvertise Web Snippet -->
-  <script src="https://publisher.linkvertise.com/cdn/linkvertise.js"></script>
+  <script src=\"https://publisher.linkvertise.com/cdn/linkvertise.js\"></script>
   <script>linkvertise({LINKVERTISE_USER_ID},{{ whitelist:[], blacklist:[] }});</script>
 </head>
 <body>
   <h1>Galerie de Téléchargement</h1>
-  <div class="grid">
-"""
+  <div class=\"grid\">"""
 
 HTML_TAIL = """
   </div>
@@ -95,26 +73,25 @@ HTML_TAIL = """
 </html>
 """
 
-def make_card(filename, code):
+def make_card(filename: str, code: str) -> str:
     name = Path(filename).stem
-    # Cherche toute extension d’image disponible pour ce code
+    # vignette
     thumb = None
-    for ext in IMAGE_EXTS.union({'.gif'}):
-        candidate = IMAGES_DIR / f"{name}{ext}"
-        if candidate.exists():
-            thumb = candidate.name
+    for ext in IMAGE_EXTS:
+        p = IMAGES_DIR / f"{sanitize_name(name)}{ext}"
+        if p.exists():
+            thumb = p.name
             break
-
-    images_url = thumb or "https://via.placeholder.com/200x150?text=No+Thumb"
-    raw_aff   = f"https://1fichier.com/?{code}&af=5091183"
-    return f'''
+    img_src = f"images/{thumb}" if thumb else "https://via.placeholder.com/200x150?text=No+Thumb"
+    raw_aff = f"https://1fichier.com/?{code}&af=5091183"
+    return f"""
     <div class="card">
       <a href="{raw_aff}" target="_blank">
-        <img src="images/{images_url}" alt="{name}" />
+        <img src="{img_src}" alt="{name}" />
         <div class="card-title">{name}</div>
       </a>
     </div>
-    '''
+    """
 
 
 def get_first_video(folder: Path) -> Path | None:
@@ -133,8 +110,9 @@ def sanitize_name(name: str) -> str:
     clean = re.sub(TRAILING_DOTS_SPACES, '', clean)
     return clean or "archive"
 
-def upload_to_1fichier(client, file_path: Path, links_map: dict) -> str:
+def upload_to_1fichier(client, file_path: Path) -> str:
     """Envoie le fichier sur 1fichier.com et renvoie le lien de téléchargement."""
+    # Obtention du serveur d'upload
     resp = client.api_call(
         'https://api.1fichier.com/v1/upload/get_upload_server.cgi', method='GET'
     )
@@ -144,6 +122,7 @@ def upload_to_1fichier(client, file_path: Path, links_map: dict) -> str:
 
     def progress_callback(monitor):
         pct = int(100 * monitor.bytes_read / monitor.len)
+        # on print seulement aux multiples de 10 et une seule fois chacun
         if pct % 10 == 0 and pct != last_printed['pct']:
             print(f"Progression upload: {pct}%")
             last_printed['pct'] = pct
@@ -151,6 +130,7 @@ def upload_to_1fichier(client, file_path: Path, links_map: dict) -> str:
     with open(file_path, 'rb') as f:
         encoder = MultipartEncoder({'file[]': (file_path.name, f, 'application/octet-stream')})
         monitor = MultipartEncoderMonitor(encoder, progress_callback)
+
 
         headers = {'Content-Type': monitor.content_type}
         if client.authed:
@@ -167,13 +147,7 @@ def upload_to_1fichier(client, file_path: Path, links_map: dict) -> str:
         if not m:
             raise FichierResponseNotOk('Lien de téléchargement introuvable')
 
-        link = m.group(1)
-        # on conserve le lien sous la clé <nom_fichier>
-        links_map[file_path.name] = link
-        # on sauvegarde immédiatement
-        with LINKS_FILE.open("w", encoding="utf-8") as jf:
-            json.dump(links_map, jf, ensure_ascii=False, indent=2)
-        return link
+        return m.group(1).split('?')[1]
 
 def extract_rar_with_unrar(archive_path: str, dest_dir: Path) -> bool:
     cmd = [
@@ -332,46 +306,45 @@ def collect_first_images():
         else:
             print(f"[SKIP]   Aucune vidéo non plus dans « {sub.name} ». Pas de vignette générée.")
 
-def build_gallery_html(codes):
+def build_gallery_html_string(codes):
     """
     codes: liste de noms de fichiers (ex. ['1499 dezomorfina.zip', ...])
-    Utilise links.json pour récupérer l’URL 1fichier de chaque archive.
+    Retourne la chaîne HTML complète de la galerie, sans l’écrire sur le disque.
     """
-    # charge le mapping fichier → URL
-    if LINKS_FILE.exists():
-        links_map = json.loads(LINKS_FILE.read_text(encoding="utf-8"))
-    else:
-        links_map = {}
+    html = [HTML_HEAD]
 
     placeholder = "https://via.placeholder.com/200x150?text=No+Thumb"
-    out = BASE_DIR / "index.html"
-    with out.open("w", encoding="utf-8") as f:
-        f.write(HTML_HEAD)
+    for archive_name in codes:
+        stem = Path(archive_name).stem
+        safe = sanitize_name(stem)
 
-        for archive_name in codes:
-            stem = Path(archive_name).stem
-            safe = sanitize_name(stem)
+        # cherche la vignette locale
+        thumb = None
+        for img in IMAGES_DIR.iterdir():
+            if img.stem == safe:
+                thumb = img.name
+                break
 
-            # vignette
-            thumb = next((img.name for img in IMAGES_DIR.iterdir() if img.stem == safe), None)
-            img_src = f"images/{thumb}" if thumb else placeholder
+        # si pas de vignette, on utilisera le placeholder
+        img_src = f"images/{thumb}" if thumb else placeholder
 
-            # lien 1fichier ou fallback local
-            href = links_map.get(archive_name, f"archives/{archive_name}")
-            download_attr = "" if href.startswith("http") else " download"
+        # lien 1fichier déjà récupéré dans `codes` (tu peux remplacer par le lien direct)
+        # ici on suppose que `codes` est une liste de tuples (archive_name, code_1fichier)
+        # sinon adapte pour récupérer `code` depuis ton stockage en mémoire
+        code_1fichier = codes[archive_name]
+        raw_aff = f"https://1fichier.com/?{code_1fichier}&af=5091183"
 
-            f.write(f'''
+        html.append(f'''
     <div class="card">
-      <a href="{href}" target="_blank"{download_attr}>
+      <a href="{raw_aff}" target="_blank">
         <img src="{img_src}" alt="{stem}" />
         <div class="card-title">{stem}</div>
       </a>
     </div>
-            ''')
+        ''')
 
-        f.write(HTML_TAIL)
-
-    print(f"[INFO] Galerie générée → {out}")
+    html.append(HTML_TAIL)
+    return "".join(html)
 
 class FichierClient:
     def __init__(self):
@@ -415,16 +388,20 @@ def main():
     if not CODES_FILE.exists():
         CODES_FILE.touch()
         print(f"[INFO] Création de {CODES_FILE}")
-    if LINKS_FILE.exists():
-        links_map = json.loads(LINKS_FILE.read_text(encoding="utf-8"))
-    else:
-        links_map = {}
 
-    # 2. Chargement des archives déjà traitées
+    # 2. Chargement des archives déjà traitées et de leurs codes si présents
     processed = set()
+    codes_map = {}
     with CODES_FILE.open("r", encoding="utf-8") as f:
         for line in f:
-            processed.add(line.strip())
+            entry = line.strip()
+            if not entry:
+                continue
+            parts = entry.split("|", 1)
+            name = parts[0]
+            processed.add(name)
+            if len(parts) == 2 and parts[1]:
+                codes_map[name] = parts[1]
     print(f"[INFO] {len(processed)} archive(s) déjà enregistrée(s) dans codes.txt")
 
     # 3. Sélection du dossier source
@@ -446,8 +423,8 @@ def main():
     ]
     print(f"[INFO] {len(archives)} archive(s) détectée(s)")
 
+    # 5. Upload, extraction et enregistrement des nouveaux
     for entry in archives:
-        # `entry` est le nom de fichier, ex. "mon_archive.zip"
         if entry in processed:
             print(f"[SKIP] {entry} déjà traité")
             continue
@@ -455,30 +432,33 @@ def main():
         path = Path(source_folder) / entry
         print(f"=== Traitement et upload de {entry} ===")
         try:
-            # upload (on peut conserver la récupération de lien si utile)
-            link = upload_to_1fichier(client, path, links_map)
-            print(f"[DEBUG] Lien retourné : {link}")
+            link_code = upload_to_1fichier(client, path)
+            print(f"[DEBUG] Lien retourné : {link_code}")
         except Exception as e:
             print(f"[UPLOAD ERREUR] {e}")
             continue
 
-        # Extraction après upload
-        extract_archive(str(path))
-
-        # Enregistrement du nom d'archive dans codes.txt
+        # Stockage
+        codes_map[entry] = link_code
         with CODES_FILE.open("a", encoding="utf-8") as f:
-            f.write(entry + "\n")
-            f.flush()
+            f.write(f"{entry}|{link_code}\n")
         processed.add(entry)
         print(f"[OK] '{entry}' ajouté à codes.txt")
 
-    # 5. Création des vignettes
+        # Extraction
+        extract_archive(str(path))
+
+    # 6. Création des vignettes
     collect_first_images()
 
-    # 6. Génération HTML
-    build_gallery_html(sorted(processed))
+    # 7. Génération HTML de la galerie
+    html_content = build_gallery_html_string(codes_map)
+    output_file = BASE_DIR / "index.html"
+    with output_file.open("w", encoding="utf-8") as f:
+        f.write(html_content)
+    print(f"[OK] Galerie HTML générée dans {output_file}")
 
-    # 7. Nettoyage des dossiers extraits
+    # 8. Nettoyage des dossiers extraits
     print("[INFO] Nettoyage des dossiers d'archives…")
     for sub in ARCHIVES_DIR.iterdir():
         if sub.is_dir():
@@ -490,7 +470,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
